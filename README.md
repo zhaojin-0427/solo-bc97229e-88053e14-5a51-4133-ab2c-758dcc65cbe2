@@ -16,6 +16,8 @@
 | 失败或重启不留半批，成功关系保留 | 每批一个 SQLite 事务，失败 `ROLLBACK`；WAL + 命名卷持久化，重启后已提交数据保留 |
 | 一次追溯查询只读一个完整提交状态 | 追溯在单个延迟读事务内完成，SQLite 事务快照保证一致性 |
 | 图校验不占库写事务，校验期间其他批次可提交、追溯保持响应 | 校验全程在 Python 内存进行、不持任何库锁；仅短写事务入库，WAL 使读写不互斥 |
+| 上传等待写锁时，已入库数据的查询不被拖住 | 上传/提交/查询使用**彼此隔离的固定大小线程池**；写锁等待只占用提交池线程，查询池永不因上传占满而排队（见 §6） |
+| 执行资源须有明确上限，不靠调大线程池/缩短锁等待/拒收合法上传 | `LINEAGE_UPLOAD_WORKERS` / `LINEAGE_COMMIT_WORKERS` / `LINEAGE_QUERY_WORKERS` / `LINEAGE_MAX_INFLIGHT_UPLOADS` 显式有界；超准入者异步排队而非拒收；`busy_timeout` 与重试上限保持原值 |
 | 并发上传按提交时完整谱系判定；分别合法但合并成环的两批不能都成功；合法批次不能仅因别批提交被拒 | 乐观并发控制（OCC）：提交时校验图版本，冲突则回滚并基于最新完整谱系**库外重新校验后重试**，成环才拒收 |
 
 ## 2. 快速启动（Docker Compose）
@@ -45,7 +47,7 @@ python3 -m venv --without-pip .venv
 .venv/bin/python get-pip.py            # 若系统无 pip
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest -q                    # 23 个单元/接口/并发测试
+.venv/bin/pytest -q                    # 单元 / 接口 / 并发 / 执行资源隔离测试
 ```
 
 ## 4. HTTP 接口
@@ -143,6 +145,26 @@ curl http://localhost:8000/api/v1/samples/S001/affected
 - 互不相关的合法批次并发：冲突仅触发重试，最终全部成功。
 - 环检测复杂度 O(V+E)，迭代实现避免深谱系图的递归栈溢出。
 
+### 6.1 执行资源与查询隔离
+
+上传在写锁上等待时不能拖垮查询，靠的是**执行资源分组**而非调大线程池：
+
+| 线程池 | 承担的阶段 | 默认线程数 | 关键点 |
+| --- | --- | --- | --- |
+| 上传池 | CSV 解析、快照读、库外判环 | `LINEAGE_UPLOAD_WORKERS`=4 | 从不持有写锁 |
+| 提交池 | `BEGIN IMMEDIATE` 短写事务 | `LINEAGE_COMMIT_WORKERS`=1 | **写锁等待只发生在这里** |
+| 查询池 | 追溯、批次列表、全图、健康检查 | `LINEAGE_QUERY_WORKERS`=4 | 与上传/提交不共享任何线程 |
+
+- 每个池内的工作单元自行建立并在同一线程内关闭 SQLite 连接，连接不跨线程交接。
+- 上传准入另有显式上限 `LINEAGE_MAX_INFLIGHT_UPLOADS`：超出者在事件循环中
+  `await` 排队，不占工作线程、**不被拒收**；锁释放后仍按提交时谱系重判并提交。
+- 因为 SQLite 只有一个写者，提交池仅需 1 个线程；上传的“等待”发生在提交池，
+  查询池始终空闲可用。WAL 下读事务不被写事务阻塞，查询读到的始终是某个
+  完整提交状态（含 `graph_version`）。
+- 慢校验只占上传池线程，不阻塞提交池，因此其他批次仍能在校验进行时提交。
+- 回归测试：`tests/test_resource_isolation.py` 覆盖“上传耗尽执行容量”“持锁时
+  发起查询”“解锁后提交”“并发成环拒收”等交错场景。
+
 ## 7. 项目结构
 
 ```
@@ -152,9 +174,10 @@ app/
   graph.py       # 图构建与环检测（迭代三色 DFS，含自环）
   csv_utils.py   # CSV 解析与非空文本校验（中英文表头）
   exceptions.py  # 业务异常与 HTTP 状态码映射
-  service.py     # 批次提交 OCC 流程、追溯 BFS、只读视图
+  service.py     # 批次提交 OCC 流程（prepare→commit）、追溯、只读视图
   schemas.py     # Pydantic 响应模型
-  routes.py      # API 路由
+  executors.py   # 上传/提交/查询三组隔离的固定大小线程池 + 上传准入上限
+  routes.py      # API 路由（各阶段分派到对应线程池）
   main.py        # 应用入口、异常处理、/docs 与 /demo 演示页
 tests/           # pytest 套件 + 真实 HTTP 并发脚本
 examples/        # 演示用 CSV
@@ -167,7 +190,11 @@ Dockerfile, docker-compose.yml
 | --- | --- | --- |
 | `LINEAGE_DATA_DIR` | `./data`（容器内 `/data`） | 数据库目录 |
 | `LINEAGE_DB_PATH` | `DATA_DIR/lineage.db` | SQLite 文件全路径 |
-| `LINEAGE_BUSY_TIMEOUT_MS` | `15000` | 写锁等待超时 |
+| `LINEAGE_BUSY_TIMEOUT_MS` | `15000` | 写锁等待超时（保持原值，不靠缩短它腾资源） |
 | `LINEAGE_MAX_RETRIES` | `50` | OCC 冲突后库外重校验重试上限 |
 | `LINEAGE_MAX_UPLOAD_BYTES` | `20971520` | 单文件大小上限（20 MiB） |
 | `LINEAGE_MAX_UPLOAD_ROWS` | `200000` | 单批有效行数上限 |
+| `LINEAGE_UPLOAD_WORKERS` | `4` | 上传池线程数（解析/快照/库外判环） |
+| `LINEAGE_COMMIT_WORKERS` | `1` | 提交池线程数（短写事务；SQLite 仅一个写者） |
+| `LINEAGE_QUERY_WORKERS` | `4` | 查询池线程数（与上传/提交隔离） |
+| `LINEAGE_MAX_INFLIGHT_UPLOADS` | `8` | 已准入上传上限，超出者异步排队、不拒收 |

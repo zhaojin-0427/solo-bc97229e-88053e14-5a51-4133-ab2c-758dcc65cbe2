@@ -12,8 +12,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import __version__, database
+from . import __version__, config, database
 from .exceptions import LineageError
+from .executors import Executors
 from .routes import router
 
 DEMO_PAGE = """<!doctype html>
@@ -103,13 +104,21 @@ function loadDup() {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 每个请求新建短连接；保留连接工厂而非共享连接，
-    # 避免多线程执行器下共享连接的线程归属问题
-    app.state.session = database.session
-    app.state.loop = asyncio.get_running_loop()
+    # 每个池内工作单元新建短连接并在同一线程内关闭，
+    # 避免共享连接跨线程交接
+    loop = asyncio.get_running_loop()
+    app.state.loop = loop
+    app.state.db_path = str(config.DB_PATH)
+    # 上传 / 提交 / 查询使用彼此隔离的固定大小线程池（资源总量显式有界）
+    executors = Executors()
+    executors.bind(loop)
+    app.state.executors = executors
     with database.session() as conn:
         database.init_db(conn)
-    yield
+    try:
+        yield
+    finally:
+        executors.shutdown()
 
 
 app = FastAPI(

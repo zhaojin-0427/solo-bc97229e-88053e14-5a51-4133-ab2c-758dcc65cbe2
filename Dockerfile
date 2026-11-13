@@ -1,4 +1,4 @@
-# 轻量运行镜像：系统自带 sqlite，无需额外系统包
+# 轻量运行镜像：Python 3.11 自带 sqlite，无需额外系统包
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -21,11 +21,13 @@ VOLUME ["/data"]
 EXPOSE 8000
 
 # 容器级健康检查：命中应用 /health，失败由编排层可见
-HEALTHCHECK --interval=10s --timeout=5s --start-period=5s --retries=5 \
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
     CMD python -c "import json,urllib.request,sys; \
 r=urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=4); \
 sys.exit(0 if json.load(r)['status']=='ok' else 1)"
 
-# uvicorn 多 worker 安全：SQLite 以 WAL + 短事务支持多进程并发，
-# 写串行化由库内锁与应用层乐观版本重试共同保证
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# 单 worker：SQLite 只有一个写者，上传准入与 OCC 重试状态在进程内，
+# 查询/上传/提交的执行资源按进程显式有界（见 app/executors.py）。
+# 多进程会让准入上限与重试语义分散到各进程，故容器内固定单进程。
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--proxy-headers"]

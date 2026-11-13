@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 from . import config
 
@@ -19,7 +20,9 @@ from . import config
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     """打开一个连接并应用谱系服务所需的 PRAGMA。"""
     path = str(db_path or config.DB_PATH)
+    # 数据目录与库文件所在目录都可能被单独覆盖，分别确保存在
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(
         path,
         timeout=config.BUSY_TIMEOUT_MS / 1000.0,

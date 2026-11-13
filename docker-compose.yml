@@ -7,8 +7,14 @@ services:
       - "8000:8000"
     environment:
       LINEAGE_DATA_DIR: /data
+      # 写锁等待与 OCC 重试（不靠缩短它们来“腾出”查询资源）
       LINEAGE_BUSY_TIMEOUT_MS: "15000"
       LINEAGE_MAX_COMMIT_RETRIES: "50"
+      # 执行资源显式上限：上传/提交/查询彼此隔离
+      LINEAGE_UPLOAD_WORKERS: "4"
+      LINEAGE_COMMIT_WORKERS: "1"
+      LINEAGE_QUERY_WORKERS: "4"
+      LINEAGE_MAX_INFLIGHT_UPLOADS: "8"
     volumes:
       # 命名卷持久化 SQLite 主库与 WAL 文件，重启后已提交关系保留
       - lineage-data:/data
@@ -18,7 +24,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 5s
+      start_period: 10s
 
 volumes:
   lineage-data:

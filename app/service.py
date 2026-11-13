@@ -12,6 +12,9 @@
      完整谱系重新校验。若新谱系下仍合法则本批照样成功；若成环则
      返回真实环路。因此“分别合法、合并成环”的两批只有先提交者成功，
      而合法批次不会仅因并发冲突被直接拒绝。
+
+第 1、2 步在 HTTP 路径上由上传池执行，第 3 步由提交池执行（见
+executors.py / routes.py），因此写锁等待只会占用提交池线程。
 """
 
 from __future__ import annotations
@@ -31,7 +34,21 @@ class Snapshot:
     edges: list[tuple[str, str]]
 
 
+@dataclass
+class PreparedBatch:
+    """已完成库外校验、等待短写事务提交的一批关系。"""
+
+    version: int                    # 校验所基于的已提交谱系版本
+    edges: list[tuple[str, str]]
+    received_rows: int
+
+
+class CommitConflict(Exception):
+    """提交阶段发现版本已变或写锁暂不可得：本批尚未写入，应重试。"""
+
+
 # ---------------------------------------------------------------- 快照读取
+
 
 def _load_snapshot(conn: sqlite3.Connection) -> Snapshot:
     """读取一个完整提交状态的谱系快照（短读事务，WAL 下不阻塞写）。"""
@@ -66,104 +83,135 @@ def _get_or_create_sample_id(conn: sqlite3.Connection, code: str,
     return row["id"]
 
 
+def prepare_batch(conn: sqlite3.Connection,
+                  new_edges: list[tuple[str, str]],
+                  received_rows: int) -> PreparedBatch:
+    """读取完整已提交谱系，并在内存中把本批边合并后判环。
+
+    全程只使用一个延迟读事务（读完即提交释放），不进入写事务、不持写锁，
+    因此单批的校验耗时不会阻塞其他批次的提交或任何查询。成环整批拒绝。
+    """
+    snapshot = _load_snapshot(conn)
+    base_graph = graph_mod.build_graph(snapshot.edges)
+    candidate_graph = graph_mod.merge_edges(base_graph, new_edges)
+    cycle = graph_mod.find_cycle(candidate_graph)
+    if cycle is not None:
+        # 自环同样在此被捕获（find_cycle 返回 [X, X]）
+        raise CycleRejectedError(cycle)
+    return PreparedBatch(
+        version=snapshot.version,
+        edges=list(new_edges),
+        received_rows=received_rows,
+    )
+
+
+def commit_prepared(conn: sqlite3.Connection, prepared: PreparedBatch) -> dict:
+    """用一个短写事务提交已校验的批次（写锁只在此处被持有）。
+
+    事务内先比对图版本：与校验时不一致说明期间有别批提交，回滚并抛
+    CommitConflict，由调用方基于最新完整谱系重新校验后重试；因此
+    合法批次不会仅因并发冲突被拒绝，而“分别合法、合并成环”的批次
+    会在重试时以真实环路被拒。任何失败都 ROLLBACK，不留半批数据。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current_version = get_graph_version(conn)
+        if current_version != prepared.version:
+            raise CommitConflict("snapshot version changed")
+
+        sample_id_cache: dict[str, int] = {}
+        cur = conn.execute(
+            "INSERT INTO batches(received_rows, inserted_edges, "
+            "duplicate_edges, status, graph_version) "
+            "VALUES (?, 0, 0, 'committed', ?)",
+            (prepared.received_rows, current_version + 1),
+        )
+        batch_id = cur.lastrowid
+
+        # 以当前写事务内可见的最新已提交边为基准判重，
+        # 避免 OCC 重试场景下沿用过期快照导致 UNIQUE 冲突
+        existing: set[tuple[str, str]] = {
+            (r["parent_code"], r["child_code"])
+            for r in conn.execute(
+                """
+                SELECT p.code AS parent_code, c.code AS child_code
+                FROM edges e
+                JOIN samples p ON p.id = e.parent_id
+                JOIN samples c ON c.id = e.child_id
+                """
+            ).fetchall()
+        }
+        inserted = 0
+        for parent, child in prepared.edges:
+            if (parent, child) in existing:
+                continue  # 重复关系合一：库内已有（含批内重复），跳过
+            existing.add((parent, child))
+            pid = _get_or_create_sample_id(conn, parent, sample_id_cache)
+            cid = _get_or_create_sample_id(conn, child, sample_id_cache)
+            conn.execute(
+                "INSERT INTO edges(parent_id, child_id, batch_id) "
+                "VALUES (?, ?, ?)",
+                (pid, cid, batch_id),
+            )
+            inserted += 1
+
+        conn.execute(
+            "UPDATE batches SET inserted_edges = ?, duplicate_edges = ? "
+            "WHERE id = ?",
+            (inserted, prepared.received_rows - inserted, batch_id),
+        )
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'graph_version'",
+            (str(current_version + 1),),
+        )
+        conn.execute("COMMIT")
+        return {
+            "batch_id": batch_id,
+            "received_rows": prepared.received_rows,
+            "inserted_edges": inserted,
+            "duplicate_edges": prepared.received_rows - inserted,
+            "graph_version": current_version + 1,
+            "retry_count": 0,
+        }
+    except CommitConflict:
+        _safe_rollback(conn)
+        raise
+    except sqlite3.OperationalError as exc:
+        # 写锁竞争（busy_timeout 内未拿到锁）等：本事务未写入，可安全重试
+        _safe_rollback(conn)
+        raise CommitConflict(str(exc)) from exc
+    except BaseException:
+        _safe_rollback(conn)
+        raise
+
+
 def submit_batch(conn: sqlite3.Connection,
                  new_edges: list[tuple[str, str]],
-                 received_rows: int) -> dict:
+                 received_rows: int,
+                 *,
+                 max_prepare_retries: int | None = None) -> dict:
     """提交一批关系，返回批次回执；成环则抛 CycleRejectedError。
 
-    校验全部在写事务之外完成；写事务只负责版本检查与插入，
-    任一失败都 ROLLBACK，数据库不留半批数据。
+    进程内调用路径（单连接；prepare 与 commit 在同一线程依次执行）。
+    HTTP 路径把这两个阶段分别交给上传池与提交池执行，见 routes.py。
     """
-    attempts = 0
+    if max_prepare_retries is None:
+        max_prepare_retries = config.MAX_COMMIT_RETRIES
+    prepare_retries = 0
     while True:
-        attempts += 1
-        snapshot = _load_snapshot(conn)
-
-        # ---- 库外校验（无库锁）：与已入库完整谱系合并后判环 ----
-        base_graph = graph_mod.build_graph(snapshot.edges)
-        candidate_graph = graph_mod.merge_edges(base_graph, new_edges)
-        cycle = graph_mod.find_cycle(candidate_graph)
-        if cycle is not None:
-            # 自环同样在此被捕获（find_cycle 返回 [X, X]）
-            raise CycleRejectedError(cycle)
-
-        # ---- 短写事务：乐观版本检查后提交 ----
+        prepared = prepare_batch(conn, new_edges, received_rows)
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            current_version = get_graph_version(conn)
-            if current_version != snapshot.version:
-                # 期间有别批提交：放弃本事务，用最新完整谱系重判
-                conn.execute("ROLLBACK")
-                if attempts > config.MAX_COMMIT_RETRIES:
-                    raise LineageError(
-                        "并发冲突重试次数过多，请稍后重新提交",
-                        {"retries": attempts - 1},
-                    )
-                continue
-
-            sample_id_cache: dict[str, int] = {}
-            cur = conn.execute(
-                "INSERT INTO batches(received_rows, inserted_edges, "
-                "duplicate_edges, status, graph_version) "
-                "VALUES (?, 0, 0, 'committed', ?)",
-                (received_rows, current_version + 1),
-            )
-            batch_id = cur.lastrowid
-
-            # 以当前写事务内可见的最新已提交边为基准判重，
-            # 避免 OCC 重试场景下沿用过期快照导致 UNIQUE 冲突
-            existing: set[tuple[str, str]] = {
-                (r["parent_code"], r["child_code"])
-                for r in conn.execute(
-                    """
-                    SELECT p.code AS parent_code, c.code AS child_code
-                    FROM edges e
-                    JOIN samples p ON p.id = e.parent_id
-                    JOIN samples c ON c.id = e.child_id
-                    """
-                ).fetchall()
-            }
-            inserted = 0
-            for parent, child in new_edges:
-                if (parent, child) in existing:
-                    continue  # 重复关系合一：库内已有（含批内重复），跳过
-                existing.add((parent, child))
-                pid = _get_or_create_sample_id(conn, parent, sample_id_cache)
-                cid = _get_or_create_sample_id(conn, child, sample_id_cache)
-                conn.execute(
-                    "INSERT INTO edges(parent_id, child_id, batch_id) "
-                    "VALUES (?, ?, ?)",
-                    (pid, cid, batch_id),
-                )
-                inserted += 1
-
-            conn.execute(
-                "UPDATE batches SET inserted_edges = ?, duplicate_edges = ? "
-                "WHERE id = ?",
-                (inserted, received_rows - inserted, batch_id),
-            )
-            conn.execute(
-                "UPDATE meta SET value = ? WHERE key = 'graph_version'",
-                (str(current_version + 1),),
-            )
-            conn.execute("COMMIT")
-            return {
-                "batch_id": batch_id,
-                "received_rows": received_rows,
-                "inserted_edges": inserted,
-                "duplicate_edges": received_rows - inserted,
-                "graph_version": current_version + 1,
-                "retry_count": attempts - 1,
-            }
-        except sqlite3.OperationalError as exc:
-            # 写锁竞争（busy_timeout 内未拿到锁）等：安全重试
-            _safe_rollback(conn)
-            if attempts > config.MAX_COMMIT_RETRIES:
-                raise LineageError(f"数据库忙，重试失败：{exc}") from exc
+            receipt = commit_prepared(conn, prepared)
+        except CommitConflict as exc:
+            prepare_retries += 1
+            if prepare_retries > max_prepare_retries:
+                raise LineageError(
+                    "并发冲突重试次数过多，请稍后重新提交",
+                    {"retries": prepare_retries - 1},
+                ) from exc
             continue
-        except Exception:
-            _safe_rollback(conn)
-            raise
+        receipt["retry_count"] = prepare_retries
+        return receipt
 
 
 def _safe_rollback(conn: sqlite3.Connection) -> None:
@@ -286,6 +334,32 @@ def get_graph_overview(conn: sqlite3.Connection) -> dict:
                  "child_sample": r["child_code"]}
                 for r in rows
             ],
+        }
+    except Exception:
+        _safe_rollback(conn)
+        raise
+
+
+def health_snapshot(conn: sqlite3.Connection) -> dict:
+    """健康检查所需的最小读取：单一读事务内的完整提交状态。
+
+    不拉取全部边（避免健康检查在大图上变慢），但版本、样本数与边数
+    取自同一快照，彼此一致。
+    """
+    conn.execute("BEGIN DEFERRED")
+    try:
+        version = get_graph_version(conn)
+        sample_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM samples"
+        ).fetchone()["n"]
+        edge_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM edges"
+        ).fetchone()["n"]
+        conn.execute("COMMIT")
+        return {
+            "graph_version": version,
+            "sample_count": sample_count,
+            "edge_count": edge_count,
         }
     except Exception:
         _safe_rollback(conn)
