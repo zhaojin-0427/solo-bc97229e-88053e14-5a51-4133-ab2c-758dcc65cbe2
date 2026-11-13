@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# 本地 SQLite 数据与 WAL
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# 编辑器/系统
+.idea/
+.vscode/
+.DS_Store

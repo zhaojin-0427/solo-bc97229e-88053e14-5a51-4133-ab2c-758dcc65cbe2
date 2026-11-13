@@ -1,0 +1,24 @@
+services:
+  lineage-api:
+    build: .
+    image: lims-lineage-api:1.0.0
+    container_name: lims-lineage-api
+    ports:
+      - "8000:8000"
+    environment:
+      LINEAGE_DATA_DIR: /data
+      LINEAGE_BUSY_TIMEOUT_MS: "15000"
+      LINEAGE_MAX_COMMIT_RETRIES: "50"
+    volumes:
+      # 命名卷持久化 SQLite 主库与 WAL 文件，重启后已提交关系保留
+      - lineage-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,urllib.request,sys; r=urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health',timeout=4); sys.exit(0 if json.load(r)['status']=='ok' else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  lineage-data:

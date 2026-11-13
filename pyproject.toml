@@ -1,0 +1,13 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "C4", "RUF"]
+# B008：FastAPI 依赖注入（File/Query/Body 等）本身就要求在参数默认值中调用
+# RUF001/RUF002/RUF003：中文文案、文档与注释中的全角标点属预期内容，非歧义缺陷
+ignore = ["B008", "RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
